@@ -59,7 +59,7 @@ def main():
             return (h,)
         return hook
 
-    for i, layer in enumerate(lm.layers):
+    for i, layer in enumerate(ad.layers):
         Adapter.mlp_down(layer).register_forward_pre_hook(make_hook(i))
         layer.register_forward_hook(lambda m, inp, out, i=i: resid.__setitem__(i, (out[0] if isinstance(out, tuple) else out)))
 
@@ -75,7 +75,7 @@ def main():
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     B = a.neurons_per_batch
     for l in layers:
-        W = Adapter.mlp_down(lm.layers[l]).weight  # [hidden, inter]
+        W = Adapter.down_weight(ad.layers[l])  # [hidden, inter]
         N = W.shape[1]
         unit = norms[l] / W.float().norm(dim=0)  # [N]
         out = {k: [] for k in ("up_tok", "down_tok", "up_kl", "down_kl")}

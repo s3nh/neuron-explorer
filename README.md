@@ -24,20 +24,30 @@ environment variable:
     EXPLORER_MODEL=Qwen/Qwen3.5-0.8B uv run python explorer/server.py     # same hybrid arch as 4B, ~1.6 GB
     EXPLORER_MODEL=HuggingFaceTB/SmolLM2-135M-Instruct uv run python explorer/server.py   # Llama-type, ~270 MB
 
+There is no model menu in the page: the model is chosen when the server starts. Changing it means restarting with a
+different `EXPLORER_MODEL`.
+
 What works where:
 
 - **Everywhere**: neuron steering (add / multiply), the three-column steered chat, per-token activation reading, logit
-  lens, weight-space connections, next-token logprobs. This covers SwiGLU MLPs (`gate_proj`/`up_proj`/`down_proj`:
-  Llama, Qwen, Gemma, Mistral, SmolLM…) and GPT-NeoX/GPT-2 MLPs.
+  lens, next-token logprobs. This covers SwiGLU MLPs (`gate_proj`/`up_proj`/`down_proj`: Llama, Qwen, Gemma, Mistral,
+  SmolLM…), combined `gate_up_proj` MLPs (Phi-3, GLM) and single-activation MLPs (GPT-2, GPT-NeoX, GPT-J, Falcon, Bloom,
+  OPT, Phi).
 - **Attention-head views** (head rows and patterns, head links, attn drive): standard softmax attention with separate
   q/k/v/o projections — including GQA, q/k norms and Qwen3.5's gated q_proj — plus Qwen3.5's linear attention
-  (Gated DeltaNet). On other attention layouts these views are off; everything above still works.
+  (Gated DeltaNet). On other attention layouts these views report that they are unavailable; everything above still
+  works.
+- **Web and weight-space connections**: only shipped for Qwen3.5-4B. On any other model the web starts empty until you
+  build it (SwiGLU MLPs only):
+
+      uv run python explorer/build_connections.py --model Qwen/Qwen3-0.6B
 
 Per-model data (vocab, lens and connection caches, stats) is namespaced by model, so the shipped Qwen3.5-4B caches are
-only used for Qwen3.5-4B. Rebuild them for another model with the scripts below (pass `--model`; the build scripts
-find the layer-stack prefix in the safetensors index themselves). The bulk sweep (`sweep/steer_sweep.py`) still needs
-the vLLM steering fork; the smaller `sweep/steer_lens.py`, `sweep/neuron_stats.py`, `sweep/capture_prefill.py` and
-`explorer/build_*.py` run on plain transformers.
+only used for Qwen3.5-4B. Other models build what they need on first use, or through the scripts below; those scripts
+write to the namespaced files and work on sharded and single-file checkpoints alike. Names and ranks need `names.json`
+and `runs/`, which aren't in this repo. The bulk sweep (`sweep/steer_sweep.py`) still needs the vLLM steering fork; the
+smaller `sweep/steer_lens.py`, `sweep/neuron_stats.py`, `sweep/capture_prefill.py` and `explorer/build_*.py` run on
+plain transformers.
 
 - **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
   steer lens and logit lens; click opens it; click a layer's label to view its sheet face-on. `writes` places

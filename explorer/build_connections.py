@@ -1,53 +1,43 @@
 """Direct-path connections for every neuron in every layer, for the explorer's details tab.
 
-For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = (1 + w_j) * W_down_i[:, A], w_j the
-pre-MLP norm weight of layer j. Neuron A's downstream links in layer j are column A of P, |P| z-scored over B; neuron
+For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = g_j * W_down_i[:, A], g_j the
+pre-MLP norm's gain in layer j (arch.Adapter.norm_gain). Neuron A's downstream links in layer j are column A of P, |P| z-scored over B; neuron
 B's upstream links in layer i are row B of P, |P| z-scored over A. Each neuron keeps its k strongest links per side
 across all layers, with sign(P).
 
     uv run python explorer/build_connections.py            # CUDA, about 5 min on a 4090
 
-Writes explorer/cache/connections.npz: {down,up}_layer [L, N, k] int8, {down,up}_n int16, {down,up}_z float16,
+Needs SwiGLU MLPs (gate and up rows). Writes explorer/cache/connections.npz (connections__<model>.npz for models other
+than Qwen3.5-4B): {down,up}_layer [L, N, k] int8, {down,up}_n int16, {down,up}_z float16,
 {down,up}_sign int8.
 """
 import argparse
-import json
 import os
 import time
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
 
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from arch import Adapter
+from arch import Adapter, cache_path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
 ap.add_argument("--k", type=int, default=24)
-ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "connections.npz"))
+ap.add_argument("--out", help="default: this model's connections file in explorer/cache")
 a = ap.parse_args()
-dev = "cuda" if torch.cuda.is_available() else "mps"
+a.out = a.out or cache_path("connections.npz", a.model)
+dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
-index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-_cfg = json.load(open(os.path.join(root, "config.json")))
-cfg = _cfg.get("text_config", _cfg)
-L, N, K = cfg["num_hidden_layers"], cfg["intermediate_size"], a.k
-
-
-def tensor(name):
-    with safe_open(os.path.join(root, index[name]), "pt") as f:
-        return f.get_tensor(name).to(dev, torch.bfloat16)
-
-
-pre = Adapter.weight_prefixes(index) + "{}."
-down = [tensor(pre.format(l) + "mlp.down_proj.weight") for l in range(L)]
-gate = [tensor(pre.format(l) + "mlp.gate_proj.weight") for l in range(L)]
-up = [tensor(pre.format(l) + "mlp.up_proj.weight") for l in range(L)]
-norm = [(1.0 + tensor(pre.format(l) + "post_attention_layernorm.weight").float()).to(torch.bfloat16) for l in range(L)]
+ad = Adapter(a.model)
+ad.load(device=dev)
+L, N, K = ad.n_layers, ad.n_neurons, a.k
+if len(ad.mlp_rows(ad.layers[0])) != 2:
+    raise SystemExit("build_connections needs a SwiGLU MLP; the live connections still work for this model")
+down = [ad.down_weight(l).detach() for l in ad.layers]
+gate, up = zip(*[[p.weight.detach() for p in ad.mlp_rows(l)] for l in ad.layers])
+norm = [ad.norm_gain(ad.pre_mlp_norm(l)).to(dev, torch.bfloat16) for l in ad.layers]
 
 # running top-k per neuron and side: score, source layer, source neuron, sign
 best = {s: (torch.full((L, N, K), -1e9, device=dev), torch.zeros((L, N, K), dtype=torch.int16, device=dev),

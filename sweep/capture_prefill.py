@@ -33,7 +33,6 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
-    tok = AutoTokenizer.from_pretrained(a.model)
     ad = Adapter(a.model)
     model = ad.load(device="cuda")
     lm = ad.lm
@@ -53,7 +52,7 @@ def main():
                     raise Stop
         return hook
 
-    for i, layer in enumerate(lm.layers):
+    for i, layer in enumerate(ad.layers):
         layer.mlp.register_forward_hook(push_hook(i))
         layer.mlp.register_forward_pre_hook(cap_hook(i))
 
@@ -65,7 +64,7 @@ def main():
         if os.path.exists(out_path):
             print(f"{name}: exists, skipping", flush=True)
             continue
-        w_down = Adapter.mlp_down(lm.layers[layer]).weight.detach().T.float().cpu().numpy()  # [N, hidden]
+        w_down = Adapter.down_weight(ad.layers[layer]).detach().T.float().cpu().numpy()  # [N, hidden]
         rows = [json.loads(l) for l in open(run)]
         n_ctrl = max([r["neuron"] for r in rows if r["kind"] == "random"], default=-1) + 1
         rng = np.random.default_rng(a.seed)

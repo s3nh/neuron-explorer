@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from arch import MODEL, Adapter, slug
+from arch import CACHE, MODEL, Adapter, cache_path, slug
 
 L2NORM_FALLBACK = lambda x, dim=-1, eps=1e-6: x * torch.rsqrt(x.pow(2).sum(dim, keepdim=True) + eps)
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
@@ -27,9 +27,6 @@ REFERENCE_TEXT = (
     "def merge(a, b):\n    out = []\n    while a and b:\n        out.append(a.pop(0) if a[0] < b[0] else b.pop(0))\n"
     "    return out + a + b\nShe asked me what I thought of the plan, and I told her honestly that it seemed rushed. "
 )
-
-
-CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
 def _locked(f):
@@ -70,12 +67,7 @@ class Runtime:
         self._lens_cache = {}
 
     def _cache(self, name):
-        """Cache files are model-specific: the ones shipped with the repo describe Qwen3.5-4B, so any other
-        model reads and writes its own copies under a suffixed name."""
-        if self.model_slug == "qwen3.5-4b":
-            return os.path.join(CACHE, name)
-        stem, ext = os.path.splitext(name)
-        return os.path.join(CACHE, f"{stem}__{self.model_slug}{ext}")
+        return cache_path(name, self.arch.model_id)
 
     # ---------- loading ----------
     def ensure_loaded(self):
@@ -90,8 +82,9 @@ class Runtime:
             self.arch.load()
             self.tok = self.arch.tok
             self.dev, self.model, self.lm = self.arch.dev, self.arch.model, self.arch.lm
-            for i, layer in enumerate(self.lm.layers):
+            for i, layer in enumerate(self.arch.layers):
                 self.arch.mlp_down(layer).register_forward_pre_hook(self._hook(i))
+                layer.register_forward_pre_hook(self._batch_hook, with_kwargs=True)
                 layer.register_forward_hook(self._resid_hook(i))
                 # attention output projection: its input is the heads side by side (full attention: o_proj, one
                 # slot per head after any output gate; linear attention: out_proj, one per value head after the
@@ -111,9 +104,15 @@ class Runtime:
                     pre_mlp.register_forward_hook(self._mlp_in_hook(i))
             self.status = "ready"
 
+    def _batch_hook(self, mod, args, kwargs):
+        self._batch = (args[0] if args else kwargs["hidden_states"]).shape[0]
+
     def _hook(self, i):
         def hook(mod, inp):
             h = inp[0]
+            flat = h.dim() == 2  # OPT flattens [batch, tokens] before its MLP
+            if flat:
+                h = h.view(self._batch, -1, h.shape[-1])
             if self._capture_full is not None:
                 self._capture_full[i] = h[0].float().cpu()  # [tokens, inter]
             if self._capture_all is not None:
@@ -134,7 +133,7 @@ class Runtime:
                         h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
                     else:
                         h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
-                return (h,)
+                return (h.flatten(0, 1) if flat else h,)
         return hook
 
     def _mlp_in_hook(self, i):
@@ -142,7 +141,7 @@ class Runtime:
             if self._capture_heads is not None:  # the MLP's input after the norm, and the residual's rms per token
                 r = inp[0][0].float()
                 self._capture_heads["x"][i] = out[0].half()
-                eps = getattr(mod, "eps", None) or mod.variance_epsilon
+                eps = self.arch.norm_eps(mod)
                 self._capture_heads["rms"][i] = (r.pow(2).mean(-1) + eps).sqrt()
         return hook
 
@@ -205,7 +204,9 @@ class Runtime:
                     rotary = self.arch.rotary()
                     if rotary is not None and kwargs.get("position_embeddings") is not None:
                         cos, sin = kwargs["position_embeddings"]
-                        q, k = rotary(q, k, cos, sin)
+                        rn = getattr(mod, "rotary_ndims", None) or q.shape[-1]  # StableLM rotates only part of each head
+                        qr, kr = rotary(q[..., :rn], k[..., :rn], cos, sin)
+                        q, k = torch.cat([qr, q[..., rn:]], -1), torch.cat([kr, k[..., rn:]], -1)
                     v = mod.v_proj(x).view(T, -1, hd).transpose(0, 1)
                     self._capture_heads["q"][i] = {"kind": "full", "q": q[0].half(), "k": k[0].half(), "scale": spec["scaling"],
                                                    "v": v.half(), "s": gate}
@@ -311,7 +312,7 @@ class Runtime:
         the linearisation) and src ({(layer, head): [contribution per token 0..pos]}, for the `top` heads by size:
         attention weight times what that token's value carries)."""
         c = caps or self.heads
-        me = self.lm.layers[layer]
+        me = self.arch.layers[layer]
         with torch.inference_mode():
             x, rms = c["x"][layer][pos].float(), c["rms"][layer][pos]
             rows = self.arch.mlp_rows(me)
@@ -320,10 +321,10 @@ class Runtime:
             wg, wu = rows[0].weight[n].float(), rows[1].weight[n].float()
             g, u = wg @ x, wu @ x
             sg = torch.sigmoid(g)
-            J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * (1 + self.arch.pre_mlp_norm(me).weight.float()) / rms
+            J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * self.arch.norm_gain(self.arch.pre_mlp_norm(me)).to(rms.device) / rms
             out, T = [], {}
             for l in range(layer + 1):
-                lay = self.lm.layers[l]
+                lay = self.arch.layers[l]
                 a = self.arch.attn_module(lay)
                 W = (a.o_proj if hasattr(a, "o_proj") else a.out_proj).weight.float()
                 y = c["y"][l][:, pos].float()  # [H, D]
@@ -387,8 +388,8 @@ class Runtime:
             return json.loads(row[0])
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
-            lay = self.lm.layers[layer]
-            g = (1.0 + self.arch.pre_attn_norm(lay).weight.float())
+            lay = self.arch.layers[layer]
+            g = self.arch.norm_gain(self.arch.pre_attn_norm(lay)).to(self.dev)
             ws = self.arch.head_qk_weights(lay, head, g)
             if ws is None:
                 return {side: [] for side in ("reads", "q", "k", "writes")}
@@ -406,14 +407,14 @@ class Runtime:
             QK = torch.linalg.qr(WK.T.cpu())[0].to(WK.device)
             reads, rq, rk, wr = [], [], [], []
             for l in range(layer):
-                D = self.arch.mlp_down(self.lm.layers[l]).weight.float()  # [hidden, N]
+                D = self.arch.down_weight(self.arch.layers[l]).float()  # [hidden, N]
                 dn = D.norm(dim=0).clamp(min=1e-8)
                 reads.append(((QV.T @ D).norm(dim=0) / dn).cpu())
                 rq.append(((QQ.T @ D).norm(dim=0) / dn).cpu())
                 rk.append(((QK.T @ D).norm(dim=0) / dn).cpu())
-            for l in range(layer, len(self.lm.layers)):
-                L2 = self.lm.layers[l]
-                w = 1.0 + self.arch.pre_mlp_norm(L2).weight.float()
+            for l in range(layer, len(self.arch.layers)):
+                L2 = self.arch.layers[l]
+                w = self.arch.norm_gain(self.arch.pre_mlp_norm(L2)).to(self.dev)
                 rows = [p.weight.float() * w for p in self.arch.mlp_rows(L2)]
                 share = lambda R: (R @ QO).norm(dim=1) / R.norm(dim=1).clamp(min=1e-8)
                 s = share(rows[0])
@@ -442,8 +443,8 @@ class Runtime:
         self.ensure_loaded()
         qv, qo, spans, at = [], [], [], 0
         with self.lock, torch.inference_mode():
-            for l, lay in enumerate(self.lm.layers):
-                g = 1.0 + self.arch.pre_attn_norm(lay).weight.float()
+            for l, lay in enumerate(self.arch.layers):
+                g = self.arch.norm_gain(self.arch.pre_attn_norm(lay)).to(self.dev)
                 heads = self.arch.head_io_weights(lay, g)
                 if heads is None:
                     continue
@@ -451,7 +452,7 @@ class Runtime:
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
                     hd = WV.shape[0]
                     spans.append((l, h, at, at + hd)); at += hd
-        self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans)
+        self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans) if qv else (None, None, [])
         return self._hb
 
     @_locked
@@ -461,6 +462,8 @@ class Runtime:
         gate row inside the head's write space times the same for its up row (after the pre-MLP norm weight). Each
         side is z-scored over its heads; returns {layer: [z per head]}."""
         QV, QO, spans = self._head_bases()
+        if QV is None:
+            return {}
         with self.lock, torch.inference_mode():
             d = self.arch.down_col(layer, n)
             rows = self.arch.read_rows(layer, n)  # gate and up rows (SwiGLU), or the single MLP-in row
@@ -500,10 +503,10 @@ class Runtime:
         with self.lock, torch.inference_mode():
             for role in ("q", "k"):
                 cols, spans, at = [], [], 0
-                for l, lay in enumerate(self.lm.layers):
-                    g = 1.0 + self.arch.pre_attn_norm(lay).weight.float()
+                for l, lay in enumerate(self.arch.layers):
+                    g = self.arch.norm_gain(self.arch.pre_attn_norm(lay)).to(self.dev)
                     units, _ = self.arch.head_qk_units(lay, role, g)
-                    for W, hs in units:
+                    for W, hs in units or []:
                         cols.append(torch.linalg.qr(W.T.cpu())[0].half())
                         spans.append((l, hs, at, at + W.shape[0])); at += W.shape[0]
                 if not cols:
@@ -850,19 +853,19 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.arch.mlp_down(self.lm.layers[layer]).weight[:, n]
-            me = self.lm.layers[layer]
-            scale_me = (1.0 + self.arch.pre_mlp_norm(me).weight.float()).to(dt)
+            d = self.arch.down_weight(self.arch.layers[layer])[:, n]
+            me = self.arch.layers[layer]
+            scale_me = self.arch.norm_gain(self.arch.pre_mlp_norm(me)).to(self.dev, dt)
             my_rows = [p.weight[n] * scale_me for p in self.arch.mlp_rows(me)]
-            for j, Lyr in enumerate(self.lm.layers):
+            for j, Lyr in enumerate(self.arch.layers):
                 if j == layer:
                     continue
                 if j > layer:
-                    v = d * (1.0 + self.arch.pre_mlp_norm(Lyr).weight.float()).to(dt)
+                    v = d * self.arch.norm_gain(self.arch.pre_mlp_norm(Lyr)).to(self.dev, dt)
                     acts = [(p.weight @ v).float() for p in self.arch.mlp_rows(Lyr)]
                     side = "down"
                 else:
-                    W = self.arch.mlp_down(Lyr).weight
+                    W = self.arch.down_weight(Lyr)
                     acts = [(r @ W).float() for r in my_rows]
                     side = "up"
                 prod = acts[0]
@@ -902,13 +905,13 @@ class Runtime:
         """Top-k tokens each neuron's down column pushes up and down, for every layer. Saved as int32 arrays
         up[L, N, k], down[L, N, k]."""
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.arch.n_neurons
+        L, N = len(self.arch.layers), self.arch.n_neurons
         up = np.zeros((L, N, k), np.int32)
         down = np.zeros((L, N, k), np.int32)
-        for li, layer in enumerate(self.lm.layers):
+        for li, layer in enumerate(self.arch.layers):
             self.status = f"indexing lens {li}/{L}"
             with self.lock, torch.inference_mode():
-                W = self.arch.mlp_down(layer).weight  # [hidden, inter]
+                W = self.arch.down_weight(layer)  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
                     logits = self.arch.lm_head(self.arch.final_norm(D))[:, 0]
@@ -948,11 +951,11 @@ class Runtime:
         """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
         from datasets import load_dataset
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.arch.n_neurons
+        L, N = len(self.arch.layers), self.arch.n_neurons
         pos, neg = np.zeros((L, N), np.float32), np.zeros((L, N), np.float32)
         buf, seen = [], 0
         for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):
-            buf += self.tok(d["text"], add_special_tokens=False).input_ids + [self.tok.eos_token_id]
+            buf += self.tok(d["text"], add_special_tokens=False).input_ids + ([self.tok.eos_token_id] if self.tok.eos_token_id is not None else [])
             while len(buf) >= seq and seen < tokens:
                 chunk, buf = buf[:seq], buf[seq:]
                 self.status = f"measuring neuron ranges {seen // 1000}k/{tokens // 1000}k tokens"

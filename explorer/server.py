@@ -278,15 +278,11 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
-_lens = {}
+LENS_INDEX = rt._cache("lens_index.npz")
 
 
 def lens_index():
-    if "up" not in _lens and os.path.exists(LENS_INDEX):
-        z = np.load(LENS_INDEX)
-        _lens["up"], _lens["down"] = z["up"], z["down"]
-    return _lens if "up" in _lens else None
+    return rt.lens_index()
 
 
 @app.get("/api/search")
@@ -326,7 +322,7 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
+ACT_SCALE = rt._cache("act_scale.npz")
 MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
 
 
@@ -345,7 +341,8 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
         p = mx.numpy() / np.maximum(sc["pos"][l], 1e-3)
         q = mn.numpy() / np.minimum(sc["neg"][l], -1e-3)
         for arr, idx, sign, raw in ((p, amx.numpy(), "+", mx.numpy()), (q, amn.numpy(), "-", mn.numpy())):
-            top = np.argpartition(-arr, limit)[:limit]
+            k = builtins.min(limit, arr.size - 1)
+            top = np.argpartition(-arr, k)[:k]
             cand += [(float(arr[n]), l, int(n), sign, int(idx[n]), float(raw[n])) for n in top]
     cand.sort(reverse=True)
     idx_lens, nm = lens_index(), names()
@@ -510,6 +507,8 @@ async def head_pattern(req: Request):
     ids = (rt.chat_ids(text) if b.get("chat") else rt.tok(text).input_ids)[:MAX_INFER_TOKENS] if rt.tok else None
     if ids is None:
         return {"error": "model loading"}
+    if not 0 <= head < rt.n_heads(layer):
+        return {"error": f"layer {layer} has {rt.n_heads(layer)} heads the explorer can read"}
     if not rt.heads or rt.heads.get("ids") != ids:
         await asyncio.to_thread(rt.full_activations, ids, True)
     A = await asyncio.to_thread(rt.head_pattern, layer, head)
@@ -538,7 +537,7 @@ def _head_profiles():
     dist: mean share of |weight| on self / the previous unit / units 2-5 back / further back / the first unit;
     neg: mean share of negative weight; src: per unit string, the |weight| it receives against a uniform pattern's;
     pairs: the strongest single reads more than one unit back (past the first unit)."""
-    path = os.path.join(CACHE, "head_profiles.json")
+    path = rt._cache("head_profiles.json")
     key = json.dumps(HEAD_TEXTS)
     if _hprof.get("key") == key:
         return _hprof["data"]
@@ -625,6 +624,8 @@ def head_info(layer: int, head: int, top: int = 24):
     """What one attention head reads and writes, from weights: its linked neurons (runtime.head_links) and their
     positive-pole lens tokens pooled the way the web summary pools a cone (weighted by z, ranked by lift over each
     layer's base rate)."""
+    if rt.steer_index() is None and rt.lens_index() is None:
+        return {"error": "the lens index is still building"}
     links = rt.head_links(layer, head)
     lens, v, base, src = _lens_base()
 
@@ -664,13 +665,15 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     yellow / magenta read as "this firing pushed that one up / down"; hop is 1."""
     if "score" not in _infer or pos >= _infer["score"].shape[1]:
         return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
+    ci = rt.con_index()
+    if ci is None:  # no connections.npz for this model (build_connections.py)
+        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
     S = _infer["score"][:, pos, :]  # [L, N]
     flat = np.abs(S).ravel()
     cand = np.argpartition(-flat, min_k := builtins.min(top, flat.size - 1))[:min_k]
     cand = cand[flat[cand] >= min]
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
-    ci = rt.con_index()
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -690,7 +693,7 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
 def layout(kind: str = "writes"):
     """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    path = rt._cache(f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
     cell = np.load(path)["cell"].astype(np.int16)
@@ -703,6 +706,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     neuron's top `first` links (all when None), later hops each node's top k with z >= zmin, up to `hops` hops; each side keeps at most cap / 2 links.
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
+    if ci is None:  # no connections.npz for this model (build_connections.py): no cone, the live links still work
+        return []
     out = []
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
@@ -996,6 +1001,8 @@ async def agent_attn_drive(req: Request):
     if off := _live_off():
         return off
     layer, n, top = int(b["layer"]), int(b["n"]), int(b.get("top", 8))
+    if len(rt.arch.mlp_rows(rt.arch.layers[layer])) != 2 or not all(rt.n_heads(l) for l in range(layer + 1)):
+        return {"error": "attn drive needs a SwiGLU MLP and an attention layout the explorer can read"}
     ids, acts, caps, units = await asyncio.to_thread(_capture_text, b["text"], b.get("chat", False))
     toks = [u for u, _ in units]
     unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
@@ -1097,6 +1104,8 @@ async def agent_fires(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
+    if not os.path.exists(ACT_SCALE):
+        return {"error": "the neuron activation ranges are still building (or could not be built)"}
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
     toks = [rt.tok.decode([i]) for i in ids]
     want = b.get("token")
@@ -1821,7 +1830,11 @@ def preload():
             rt.build_lens_index(LENS_INDEX)
         rt.vocab_strings()
         if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
+            try:
+                rt.build_act_scale(ACT_SCALE)
+            except Exception as e:  # needs the web text; everything but fires and run works without it
+                print(f"activation ranges not built: {e!r}", flush=True)
+                rt.status = "ready"
     threading.Thread(target=go, daemon=True).start()
 
 

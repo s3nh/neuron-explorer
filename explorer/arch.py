@@ -6,7 +6,8 @@ What it resolves:
 - the decoder module and its layer list, final norm and lm head, across wrapper layouts
   (dense text models, VL wrappers such as Qwen3.5's `model.language_model`, GPT-NeoX, GPT-2);
 - the MLP "neuron" site: SwiGLU (`gate_proj`/`up_proj`/`down_proj`, the neurons are silu(gate) * up, which is the
-  down_proj input), GPT-NeoX (`dense_h_to_4h`/`dense_4h_to_h`) and GPT-2 (`c_fc`/`c_proj`) MLPs;
+  down_proj input) and single-activation MLPs (`dense_h_to_4h`/`dense_4h_to_h`, `c_fc`/`c_proj`, `fc_in`/`fc_out`,
+  `fc1`/`fc2`, the last also directly on the block as in OPT), and one projection holding gate and up (`gate_up_proj`);
 - the attention kind of each layer: "full" softmax attention (separate q/k/v/o projections, optional q/k norms,
   optionally a gated q_proj as in Qwen3.5) or "linear" (Qwen3.5's Gated DeltaNet). Anything else reports
   `attn_kind(layer) is None`: MLP steering, reading, lenses and connections still work, the attention-head
@@ -18,11 +19,13 @@ when available.
 import importlib
 import os
 import re
+from types import SimpleNamespace
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
 def text_config(model_id):
@@ -39,22 +42,37 @@ def text_config(model_id):
 def arch_dict(cfg):
     """What the frontend needs to draw the model: layer count and sizes, layer types, head counts. Missing
     fields (MoE sizes, linear-attention head counts on dense models) become None."""
-    inter = getattr(cfg, "intermediate_size", None) or getattr(cfg, "moe_intermediate_size", None) \
-        or getattr(cfg, "n_inner", None)
-    return {"n_layers": getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", None)),
-            "hidden": getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None)),
+    hidden = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
+    inter = _first_attr(cfg, ("intermediate_size", "moe_intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size")) \
+        or (4 * hidden if hidden else None)  # models that leave the MLP size out of the config use 4 * hidden
+    n_layers = getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", None))
+    # only "linear_attention" differs for the views; sliding and other softmax variants count as full attention
+    types = [t if t == "linear_attention" else "full_attention"
+             for t in (getattr(cfg, "layer_types", None) or ["full_attention"] * (n_layers or 0))]
+    heads = getattr(cfg, "num_attention_heads", None)
+    return {"n_layers": n_layers,
+            "hidden": hidden,
             "inter": inter,
-            "layer_types": list(getattr(cfg, "layer_types", None)
-                                or ["full_attention"] * getattr(cfg, "num_hidden_layers", 0)),
-            "attn_heads": getattr(cfg, "num_attention_heads", None),
-            "kv_heads": getattr(cfg, "num_key_value_heads", None),
+            "layer_types": types,
+            "attn_heads": heads,
+            "kv_heads": getattr(cfg, "num_key_value_heads", None) or heads,
             "linear_k_heads": getattr(cfg, "linear_num_key_heads", None),
             "linear_v_heads": getattr(cfg, "linear_num_value_heads", None)}
 
 
 def slug(model_id):
     """Short filesystem-safe name for per-model stats and caches, e.g. qwen3.5-4b, smollm2-135m."""
-    return re.sub(r"[^a-z0-9]+", "-", model_id.split("/")[-1].lower()).strip("-")
+    return re.sub(r"[^a-z0-9.]+", "-", model_id.split("/")[-1].lower()).strip("-")
+
+
+def cache_path(name, model_id=MODEL):
+    """Cache files are model-specific: the ones shipped with the repo describe Qwen3.5-4B, so any other model reads
+    and writes its own copies under a suffixed name."""
+    model = slug(model_id)
+    if model == "qwen3.5-4b":
+        return os.path.join(CACHE, name)
+    stem, ext = os.path.splitext(name)
+    return os.path.join(CACHE, f"{stem}__{model}{ext}")
 
 
 def _first_attr(obj, names):
@@ -115,11 +133,11 @@ class Adapter:
 
     @property
     def n_neurons(self):
-        return self.mlp_down(self.layers[0]).in_features
+        return self.down_weight(self.layers[0]).shape[1]
 
     @property
     def final_norm(self):
-        norm = _first_attr(self.lm, ("norm", "final_layernorm", "ln_f"))
+        norm = _first_attr(self.lm, ("norm", "final_layernorm", "final_layer_norm", "ln_f"))
         if norm is None:
             raise RuntimeError("decoder has no final norm")
         return norm
@@ -133,46 +151,86 @@ class Adapter:
 
     # ---------- MLP ----------
     @staticmethod
+    def _mlp(layer):
+        """The block's MLP module; OPT keeps its projections directly on the block."""
+        mlp = _first_attr(layer, ("mlp", "feed_forward"))
+        return layer if mlp is None else mlp
+
+    @staticmethod
     def mlp_down(layer):
         """The projection whose *input* is the neuron activations (silu(gate) * up for SwiGLU). Steering and
         reading hook this module's input; its weight column n is what neuron n writes to the residual."""
-        return _first_attr(_first_attr(layer, ("mlp", "feed_forward")), ("down_proj", "dense_4h_to_h", "c_proj"))
+        down = _first_attr(Adapter._mlp(layer), ("down_proj", "dense_4h_to_h", "c_proj", "fc_out", "fc2"))
+        if down is None:
+            raise RuntimeError(f"could not find the MLP output projection in {type(layer).__name__}")
+        return down
+
+    @staticmethod
+    def _matrix(proj):
+        """A projection's weight as [out, in]; GPT-2's Conv1D stores it the other way round."""
+        return proj.weight.T if type(proj).__name__ == "Conv1D" else proj.weight
+
+    @staticmethod
+    def down_weight(layer):
+        """[hidden, neurons]: column n is what neuron n writes into the residual."""
+        return Adapter._matrix(Adapter.mlp_down(layer))
 
     @staticmethod
     def mlp_rows(layer):
         """The projections whose weight row n reads the residual into neuron n. SwiGLU has two (gate and up;
-        their activations multiply), GPT-NeoX/GPT-2 one. Connections score with the product over these rows."""
-        mlp = _first_attr(layer, ("mlp", "feed_forward"))
+        their activations multiply), GPT-NeoX/GPT-2 one. Connections score with the product over these rows. Each
+        result's .weight is [neurons, hidden]."""
+        mlp = Adapter._mlp(layer)
         gate = _first_attr(mlp, ("gate_proj",))
         up = _first_attr(mlp, ("up_proj",))
         if gate is not None and up is not None:
             return (gate, up)
-        single = _first_attr(mlp, ("dense_h_to_4h", "c_fc"))
+        both = _first_attr(mlp, ("gate_up_proj",))
+        if both is not None:
+            return tuple(SimpleNamespace(weight=w) for w in both.weight.chunk(2, 0))
+        single = _first_attr(mlp, ("dense_h_to_4h", "c_fc", "fc_in", "fc1"))
         if single is None:
             raise RuntimeError("could not find the MLP input projections")
-        return (single,)
+        return (SimpleNamespace(weight=Adapter._matrix(single)),)
 
     @staticmethod
     def pre_mlp_norm(layer):
-        return _first_attr(layer, ("post_attention_layernorm", "post_feedforward_layernorm", "ln_2"))
+        """The norm whose output enters the MLP. Parallel blocks (Phi, Cohere, Falcon, GPT-J) share the one norm."""
+        return _first_attr(layer, ("pre_feedforward_layernorm", "post_attention_layernorm", "ln_2", "final_layer_norm",
+                                   "ln_mlp", "input_layernorm", "ln_1"))
 
     @staticmethod
     def pre_attn_norm(layer):
-        return _first_attr(layer, ("input_layernorm", "pre_feedforward_layernorm", "ln_1"))
+        return _first_attr(layer, ("input_layernorm", "ln_1", "self_attn_layer_norm"))
+
+    @staticmethod
+    def norm_eps(norm):
+        return _first_attr(norm, ("eps", "variance_epsilon")) or 1e-5
+
+    @staticmethod
+    def norm_gain(norm):
+        """The per-dimension factor a norm applies after dividing by the rms: (1 + weight) in Qwen3.5 and Gemma, weight
+        in most others, 1 without learned weights. Measured on a zero-mean unit-rms input (the difference of +x and -x
+        cancels any bias), so no model needs its own rule."""
+        w = getattr(norm, "weight", None)
+        if w is None:
+            return torch.ones(1)
+        with torch.no_grad():
+            x = torch.ones_like(w)
+            x[1::2] = -1
+            return ((norm(x[None, None]) - norm(-x[None, None]))[0, 0] / (2 * x)).float()
 
     def down_col(self, layer_i, n):
         """The direction neuron n writes into the residual stream (a down-projection weight column)."""
-        return self.mlp_down(self.layers[layer_i]).weight[:, n].detach().float()
+        return self.down_weight(self.layers[layer_i])[:, n].detach().float()
 
     def read_rows(self, layer_i, n, scaled=True):
         """Row tensors of neuron n's input projections, optionally scaled by (1 + pre-MLP norm weight)."""
         layer = self.layers[layer_i]
         rows = [p.weight[n].float() for p in self.mlp_rows(layer)]
         if scaled:
-            norm = self.pre_mlp_norm(layer)
-            if norm is not None:
-                w = (1.0 + norm.weight.float()).to(rows[0].device)
-                rows = [r * w for r in rows]
+            w = self.norm_gain(self.pre_mlp_norm(layer)).to(rows[0].device)
+            rows = [r * w for r in rows]
         return rows
 
     # ---------- attention ----------
@@ -209,9 +267,9 @@ class Adapter:
         a = self.attn_module(layer)
         if self.attn_kind(layer) == "full":
             return self.full_attn_spec(a)["nq"]
-        if hasattr(a, "num_v_heads"):
+        if self.attn_kind(layer) == "linear":
             return a.num_v_heads
-        raise RuntimeError(f"attention heads of layer {layer_i} are not supported for this architecture")
+        return 0  # attention layout the adapter doesn't know: no head views
 
     def head_io_weights(self, layer, g):
         """[(WV, WO)] per head: the head's value-read rows (scaled by g = 1 + pre-attention norm weight) and its
