@@ -1,7 +1,8 @@
 # neuron explorer
 
-Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
-rollout is kept, and the explorer lays the results out over a 3D view of the model.
+Steering-first neuron explorer for Qwen3.5-4B — or any other Hugging Face causal LM. Every MLP neuron in a layer is
+pushed up and down on a few prompts, every rollout is kept, and the explorer lays the results out over a 3D view of
+the model.
 
 ![neuron explorer](explorer.png)
 
@@ -13,6 +14,30 @@ rollout is kept, and the explorer lays the results out over a 3D view of the mod
 Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
 `explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
 steered chat, lens, connections and live inference over your own text.
+
+## Other and smaller models
+
+The explorer is architecture-agnostic: `explorer/arch.py` finds the decoder, MLP and attention parts of any HF causal
+LM (dense text models, VL wrappers like Qwen3.5's `model.language_model`, GPT-NeoX, GPT-2). Pick the model with an
+environment variable:
+
+    EXPLORER_MODEL=Qwen/Qwen3.5-0.8B uv run python explorer/server.py     # same hybrid arch as 4B, ~1.6 GB
+    EXPLORER_MODEL=HuggingFaceTB/SmolLM2-135M-Instruct uv run python explorer/server.py   # Llama-type, ~270 MB
+
+What works where:
+
+- **Everywhere**: neuron steering (add / multiply), the three-column steered chat, per-token activation reading, logit
+  lens, weight-space connections, next-token logprobs. This covers SwiGLU MLPs (`gate_proj`/`up_proj`/`down_proj`:
+  Llama, Qwen, Gemma, Mistral, SmolLM…) and GPT-NeoX/GPT-2 MLPs.
+- **Attention-head views** (head rows and patterns, head links, attn drive): standard softmax attention with separate
+  q/k/v/o projections — including GQA, q/k norms and Qwen3.5's gated q_proj — plus Qwen3.5's linear attention
+  (Gated DeltaNet). On other attention layouts these views are off; everything above still works.
+
+Per-model data (vocab, lens and connection caches, stats) is namespaced by model, so the shipped Qwen3.5-4B caches are
+only used for Qwen3.5-4B. Rebuild them for another model with the scripts below (pass `--model`; the build scripts
+find the layer-stack prefix in the safetensors index themselves). The bulk sweep (`sweep/steer_sweep.py`) still needs
+the vLLM steering fork; the smaller `sweep/steer_lens.py`, `sweep/neuron_stats.py`, `sweep/capture_prefill.py` and
+`explorer/build_*.py` run on plain transformers.
 
 - **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
   steer lens and logit lens; click opens it; click a layer's label to view its sheet face-on. `writes` places

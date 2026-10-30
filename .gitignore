@@ -27,3 +27,9 @@ explorer/cache/head_profiles.json
 
 # experiment scripts
 scripts/
+
+# per-model caches for models other than Qwen3.5-4B
+explorer/cache/*__*.sqlite
+explorer/cache/*__*.json
+explorer/cache/*__*.npz
+.venv/

@@ -14,7 +14,9 @@ import shutil
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "explorer"))
+from arch import Adapter
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.v1.capture.consumers.filesystem.reader import read_request
@@ -46,8 +48,12 @@ def main():
     neurons = [int(x) for x in a.neurons.split(",")]
     doses = [float(x) for x in a.doses.split(",")]
     tok = AutoTokenizer.from_pretrained(a.model)
-    enc = tok.apply_chat_template([{"role": "user", "content": a.prompt}], add_generation_prompt=True,
-                                  enable_thinking=False, tokenize=True)
+    try:
+        enc = tok.apply_chat_template([{"role": "user", "content": a.prompt}], add_generation_prompt=True,
+                                      enable_thinking=False, tokenize=True)
+    except (TypeError, ValueError):
+        enc = tok.apply_chat_template([{"role": "user", "content": a.prompt}], add_generation_prompt=True,
+                                      tokenize=True)
     ids = list(enc["input_ids"] if hasattr(enc, "keys") else enc)
     plen = len(ids)
     cases = [(None, 0.0)] + [(n, d) for n in neurons for d in doses]
@@ -75,8 +81,9 @@ def main():
 
     # HF reference
     # the transformers class directly: importing vllm re-registers its own qwen3_5 config with AutoConfig
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    mlp = model.model.language_model.layers[layer].mlp
+    ad = Adapter(a.model)
+    model = ad.load(device="cuda")
+    mlp = ad.lm.layers[layer].mlp
     push = {"n": None, "v": 0.0}
     seen = {}
 
@@ -116,7 +123,7 @@ def main():
         recomputed = (torch.nn.functional.silu(mlp.gate_proj(xs)) * mlp.up_proj(xs)).float()
     full = torch.tensor([ids + v_ids[0]], device="cuda")
     with torch.inference_mode():
-        model.model.language_model(input_ids=full, use_cache=False)
+        ad.lm(input_ids=full, use_cache=False)
     ref = seen["act"][0].float()[torch.tensor(e.positions, device="cuda").clamp(max=full.shape[1] - 1)]
     rel = (recomputed - ref).norm(dim=-1) / ref.norm(dim=-1)
     same_top = (recomputed.argmax(-1) == ref.argmax(-1)).float().mean()
