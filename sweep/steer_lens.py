@@ -16,7 +16,9 @@ import time
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "explorer"))
+from arch import Adapter
 
 CHAT = ["Who are you?", "Write whatever you like."]
 PLAIN = ["I think the most important thing to remember is", "Today we are going to talk about"]
@@ -34,12 +36,10 @@ def main():
     lo, _, hi = a.layers.partition("-")
     layers = list(range(int(lo), int(hi or lo) + 1))
 
-    tok = AutoTokenizer.from_pretrained(a.model)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    lm = model.model.language_model
-    ctxs = [tok.apply_chat_template([{"role": "user", "content": c}], add_generation_prompt=True, enable_thinking=False,
-                                    tokenize=True) for c in CHAT] + [tok(p).input_ids for p in PLAIN]
-    ctxs = [list(c["input_ids"] if hasattr(c, "keys") else c) for c in ctxs]
+    ad = Adapter(a.model)
+    model = ad.load(device="cuda")
+    tok, lm = ad.tok, ad.lm
+    ctxs = [ad.messages_ids([{"role": "user", "content": c}]) for c in CHAT] + [tok(p).input_ids for p in PLAIN]
     C, T = len(ctxs), max(map(len, ctxs))
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     ids = torch.tensor([[pad] * (T - len(c)) + c for c in ctxs], device="cuda")
@@ -60,7 +60,7 @@ def main():
         return hook
 
     for i, layer in enumerate(lm.layers):
-        layer.mlp.down_proj.register_forward_pre_hook(make_hook(i))
+        Adapter.mlp_down(layer).register_forward_pre_hook(make_hook(i))
         layer.register_forward_hook(lambda m, inp, out, i=i: resid.__setitem__(i, (out[0] if isinstance(out, tuple) else out)))
 
     def last_logprobs(input_ids, attn, pos):
@@ -75,7 +75,7 @@ def main():
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     B = a.neurons_per_batch
     for l in layers:
-        W = lm.layers[l].mlp.down_proj.weight  # [hidden, inter]
+        W = Adapter.mlp_down(lm.layers[l]).weight  # [hidden, inter]
         N = W.shape[1]
         unit = norms[l] / W.float().norm(dim=0)  # [N]
         out = {k: [] for k in ("up_tok", "down_tok", "up_kl", "down_kl")}

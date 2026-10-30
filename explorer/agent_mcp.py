@@ -17,8 +17,8 @@ CHAT = os.environ.get("EXPLORER_CHAT", "")
 NEURONARY = os.environ.get("NEURONARY_API", "https://mcczbdcymyhzfputyqcr.supabase.co/functions/v1/api")
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
 
-LN = {"layer": {"type": "integer", "description": "layer, 0-31"}, "n": {"type": "integer", "description": "neuron, 0-9215"}}
-HEAD = {"layer": {"type": "integer", "description": "layer, 0-31"}, "head": {"type": "integer", "description": "head: 0-15 on full-attention layers, 0-31 on linear-attention layers"}}
+LN = {"layer": {"type": "integer", "description": "layer index (see overview for the count)"}, "n": {"type": "integer", "description": "neuron index within the layer"}}
+HEAD = {"layer": {"type": "integer", "description": "layer index"}, "head": {"type": "integer", "description": "head index on that layer (head counts are in overview)"}}
 TOOLS = [
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},

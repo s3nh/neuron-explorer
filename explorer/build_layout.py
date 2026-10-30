@@ -16,6 +16,10 @@ import umap
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from arch import Adapter
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
 ap.add_argument("--kind", default="writes", choices=["writes", "reads"])
@@ -25,7 +29,8 @@ a = ap.parse_args()
 
 root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
 index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
+_cfg = json.load(open(os.path.join(root, "config.json")))
+cfg = _cfg.get("text_config", _cfg)
 L, N = cfg["num_hidden_layers"], cfg["intermediate_size"]
 side = int(round(N ** 0.5))
 assert side * side == N
@@ -36,9 +41,10 @@ def tensor(name):
         return f.get_tensor(name).float().numpy()
 
 
+PRE = Adapter.weight_prefixes(index)
 cells = np.zeros((L, N), np.int16)
 for l in range(L):
-    pre = f"model.language_model.layers.{l}.mlp."
+    pre = f"{PRE}{l}.mlp."
     if a.kind == "writes":
         X = tensor(pre + "down_proj.weight").T  # [N, hidden]
     else:

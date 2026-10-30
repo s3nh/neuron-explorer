@@ -1,9 +1,12 @@
-"""Live Qwen3.5 model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
+"""Live model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
 neuron activations on arbitrary text, and logit-lens tokens for a neuron's down column.
 
-The hook sits on the input of a layer's down_proj, where the neuron activations silu(gate) * up live, so add,
-multiply, and reading are all exact. Add doses are in units of the median residual norm leaving the layer, the same
-unit as the sweep's `--dose-unit rel`.
+The hook sits on the input of a layer's down projection, where the neuron activations silu(gate) * up live, so
+add, multiply, and reading are all exact. Add doses are in units of the median residual norm leaving the layer,
+the same unit as the sweep's `--dose-unit rel`.
+
+The architecture-specific parts (decoder layout, MLP projections, attention kinds) come from arch.Adapter, so
+any Hugging Face causal LM works; attention-head views need an attention layout the adapter knows.
 """
 import json
 import os
@@ -13,10 +16,10 @@ import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
-from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l2norm
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+from arch import MODEL, Adapter, slug
+
+L2NORM_FALLBACK = lambda x, dim=-1, eps=1e-6: x * torch.rsqrt(x.pow(2).sum(dim, keepdim=True) + eps)
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -40,10 +43,12 @@ def _locked(f):
 
 
 class Runtime:
-    def __init__(self, stats_dir):
+    def __init__(self, stats_dir, model_id=None):
         self.stats_dir = stats_dir
+        self.arch = Adapter(model_id or MODEL)
+        self.model_slug = slug(self.arch.model_id)
         os.makedirs(CACHE, exist_ok=True)
-        self._db = sqlite3.connect(os.path.join(CACHE, "connections.sqlite"), check_same_thread=False)
+        self._db = sqlite3.connect(self._cache("connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
         self._db_lock = threading.Lock()
         self._lens_idx = None
@@ -64,6 +69,14 @@ class Runtime:
         self.heads = None  # the last text's captures: {"T", "q", "writes"}, see full_activations(heads=True)
         self._lens_cache = {}
 
+    def _cache(self, name):
+        """Cache files are model-specific: the ones shipped with the repo describe Qwen3.5-4B, so any other
+        model reads and writes its own copies under a suffixed name."""
+        if self.model_slug == "qwen3.5-4b":
+            return os.path.join(CACHE, name)
+        stem, ext = os.path.splitext(name)
+        return os.path.join(CACHE, f"{stem}__{self.model_slug}{ext}")
+
     # ---------- loading ----------
     def ensure_loaded(self):
         if self.model is not None:
@@ -74,25 +87,28 @@ class Runtime:
             if self.model is not None:
                 return
             self.status = "loading"
-            dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
+            self.arch.load()
+            self.tok = self.arch.tok
+            self.dev, self.model, self.lm = self.arch.dev, self.arch.model, self.arch.lm
             for i, layer in enumerate(self.lm.layers):
-                layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
+                self.arch.mlp_down(layer).register_forward_pre_hook(self._hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
+                # attention output projection: its input is the heads side by side (full attention: o_proj, one
+                # slot per head after any output gate; linear attention: out_proj, one per value head after the
+                # gated norm). Layers whose attention the adapter doesn't know get no head views.
+                kind = self.arch.attn_kind(layer)
+                a = self.arch.attn_module(layer)
+                if kind == "full":
+                    spec = self.arch.full_attn_spec(a)
+                    a.o_proj.register_forward_pre_hook(self._head_hook(i, spec["nq"]))
+                    a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
+                elif kind == "linear":
                     a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
-                a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
-                if hasattr(layer, "linear_attn"):
+                    a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
                     a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
-                layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
+                pre_mlp = self.arch.pre_mlp_norm(layer)
+                if pre_mlp is not None:
+                    pre_mlp.register_forward_hook(self._mlp_in_hook(i))
             self.status = "ready"
 
     def _hook(self, i):
@@ -126,7 +142,8 @@ class Runtime:
             if self._capture_heads is not None:  # the MLP's input after the norm, and the residual's rms per token
                 r = inp[0][0].float()
                 self._capture_heads["x"][i] = out[0].half()
-                self._capture_heads["rms"][i] = (r.pow(2).mean(-1) + mod.eps).sqrt()
+                eps = getattr(mod, "eps", None) or mod.variance_epsilon
+                self._capture_heads["rms"][i] = (r.pow(2).mean(-1) + eps).sqrt()
         return hook
 
     def _gnorm_hook(self, i, n_heads):
@@ -169,21 +186,35 @@ class Runtime:
             x = kwargs.get("hidden_states", args[0] if args else None)
             with torch.inference_mode():
                 T = x.shape[1]
-                if hasattr(mod, "q_norm"):
-                    cos, sin = kwargs["position_embeddings"]
-                    hd = mod.head_dim
-                    q, gate = torch.chunk(mod.q_proj(x).view(1, T, -1, hd * 2), 2, dim=-1)
-                    q = mod.q_norm(q).transpose(1, 2)
-                    k = mod.k_norm(mod.k_proj(x).view(1, T, -1, hd)).transpose(1, 2)
-                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                if hasattr(mod, "q_proj"):
+                    spec = self.arch.full_attn_spec(mod)
+                    hd = spec["head_dim"]
+                    qw = mod.q_proj(x)
+                    if spec["gated_q"]:
+                        q, gate = torch.chunk(qw.view(1, T, -1, hd * 2), 2, dim=-1)
+                        gate = gate[0].float().sigmoid().transpose(0, 1).half()
+                    else:
+                        q = qw.view(1, T, -1, hd)
+                        gate = torch.ones(spec["nq"], T, 1, dtype=torch.float16).to(x.device)
+                    q = q.transpose(1, 2)
+                    if spec["q_norm"] is not None:
+                        q = spec["q_norm"](q.transpose(1, 2)).transpose(1, 2)
+                    k = mod.k_proj(x).view(1, T, -1, hd).transpose(1, 2)
+                    if spec["k_norm"] is not None:
+                        k = spec["k_norm"](k.transpose(1, 2)).transpose(1, 2)
+                    rotary = self.arch.rotary()
+                    if rotary is not None and kwargs.get("position_embeddings") is not None:
+                        cos, sin = kwargs["position_embeddings"]
+                        q, k = rotary(q, k, cos, sin)
                     v = mod.v_proj(x).view(T, -1, hd).transpose(0, 1)
-                    self._capture_heads["q"][i] = {"kind": "full", "q": q[0].half(), "k": k[0].half(), "scale": mod.scaling,
-                                                   "v": v.half(), "s": gate[0].float().sigmoid().transpose(0, 1).half()}
+                    self._capture_heads["q"][i] = {"kind": "full", "q": q[0].half(), "k": k[0].half(), "scale": spec["scaling"],
+                                                   "v": v.half(), "s": gate}
                 else:
                     qkv = mod.in_proj_qkv(x).transpose(1, 2)
                     w = mod.conv1d.weight
                     qkv = F.silu(F.conv1d(F.pad(qkv, (w.shape[-1] - 1, 0)), w, groups=mod.conv_dim)).transpose(1, 2)[0]
                     q, k, v = torch.split(qkv, [mod.key_dim, mod.key_dim, mod.value_dim], -1)
+                    l2norm = self.arch.modeling_attr("l2norm") or L2NORM_FALLBACK
                     q = l2norm(q.float().view(T, -1, mod.head_k_dim)) / mod.head_k_dim ** 0.5
                     k = l2norm(k.float().view(T, -1, mod.head_k_dim))
                     beta = mod.in_proj_b(x)[0].float().sigmoid()  # [T, Hv]
@@ -283,14 +314,18 @@ class Runtime:
         me = self.lm.layers[layer]
         with torch.inference_mode():
             x, rms = c["x"][layer][pos].float(), c["rms"][layer][pos]
-            wg, wu = me.mlp.gate_proj.weight[n].float(), me.mlp.up_proj.weight[n].float()
+            rows = self.arch.mlp_rows(me)
+            if len(rows) != 2:
+                raise RuntimeError("attn_drive needs a SwiGLU MLP (gate and up projections)")
+            wg, wu = rows[0].weight[n].float(), rows[1].weight[n].float()
             g, u = wg @ x, wu @ x
             sg = torch.sigmoid(g)
-            J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * (1 + me.post_attention_layernorm.weight.float()) / rms
+            J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * (1 + self.arch.pre_mlp_norm(me).weight.float()) / rms
             out, T = [], {}
             for l in range(layer + 1):
                 lay = self.lm.layers[l]
-                W = (lay.self_attn.o_proj if hasattr(lay, "self_attn") else lay.linear_attn.out_proj).weight.float()
+                a = self.arch.attn_module(lay)
+                W = (a.o_proj if hasattr(a, "o_proj") else a.out_proj).weight.float()
                 y = c["y"][l][:, pos].float()  # [H, D]
                 t = (W.T @ J).view(y.shape)
                 T[l] = t
@@ -353,22 +388,11 @@ class Runtime:
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
             lay = self.lm.layers[layer]
-            g = (1.0 + lay.input_layernorm.weight.float())
-            if hasattr(lay, "self_attn"):
-                a = lay.self_attn; hd = a.head_dim
-                nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
-                kv = head // (nq // nkv)
-                WV = a.v_proj.weight[kv * hd:(kv + 1) * hd].float() * g
-                WO = a.o_proj.weight[:, head * hd:(head + 1) * hd].float()
-                WQ = a.q_proj.weight.view(nq, 2 * hd, -1)[head, :hd].float() * g
-                WK = a.k_proj.weight[kv * hd:(kv + 1) * hd].float() * g
-            else:
-                a = lay.linear_attn; hd = a.head_v_dim
-                WV = a.in_proj_qkv.weight[2 * a.key_dim + head * hd: 2 * a.key_dim + (head + 1) * hd].float() * g
-                WO = a.out_proj.weight[:, head * hd:(head + 1) * hd].float() * a.norm.weight.float()
-                kh, kd = head // (a.num_v_heads // a.num_k_heads), a.head_k_dim
-                WQ = a.in_proj_qkv.weight[kh * kd:(kh + 1) * kd].float() * g
-                WK = a.in_proj_qkv.weight[a.key_dim + kh * kd:a.key_dim + (kh + 1) * kd].float() * g
+            g = (1.0 + self.arch.pre_attn_norm(lay).weight.float())
+            ws = self.arch.head_qk_weights(lay, head, g)
+            if ws is None:
+                return {side: [] for side in ("reads", "q", "k", "writes")}
+            WV, WO, WQ, WK = ws
             # orthonormal bases of the read and write spaces, so a share is a plain projection length
             QV = torch.linalg.qr(WV.T.cpu())[0].to(WV.device)  # [hidden, hd]
             QO = torch.linalg.qr(WO.cpu())[0].to(WO.device)
@@ -382,17 +406,20 @@ class Runtime:
             QK = torch.linalg.qr(WK.T.cpu())[0].to(WK.device)
             reads, rq, rk, wr = [], [], [], []
             for l in range(layer):
-                D = self.lm.layers[l].mlp.down_proj.weight.float()  # [hidden, N]
+                D = self.arch.mlp_down(self.lm.layers[l]).weight.float()  # [hidden, N]
                 dn = D.norm(dim=0).clamp(min=1e-8)
                 reads.append(((QV.T @ D).norm(dim=0) / dn).cpu())
                 rq.append(((QQ.T @ D).norm(dim=0) / dn).cpu())
                 rk.append(((QK.T @ D).norm(dim=0) / dn).cpu())
             for l in range(layer, len(self.lm.layers)):
                 L2 = self.lm.layers[l]
-                w = 1.0 + L2.post_attention_layernorm.weight.float()
-                G, U = L2.mlp.gate_proj.weight.float() * w, L2.mlp.up_proj.weight.float() * w
+                w = 1.0 + self.arch.pre_mlp_norm(L2).weight.float()
+                rows = [p.weight.float() * w for p in self.arch.mlp_rows(L2)]
                 share = lambda R: (R @ QO).norm(dim=1) / R.norm(dim=1).clamp(min=1e-8)
-                wr.append((share(G) * share(U)).cpu())
+                s = share(rows[0])
+                for R in rows[1:]:
+                    s = s * share(R)
+                wr.append(s.cpu())
             out = {}
             for side, scores, l0 in (("reads", reads, 0), ("q", rq, 0), ("k", rk, 0), ("writes", wr, layer)):
                 if not scores:
@@ -416,19 +443,13 @@ class Runtime:
         qv, qo, spans, at = [], [], [], 0
         with self.lock, torch.inference_mode():
             for l, lay in enumerate(self.lm.layers):
-                g = 1.0 + lay.input_layernorm.weight.float()
-                if hasattr(lay, "self_attn"):
-                    a = lay.self_attn; hd = a.head_dim
-                    nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
-                    heads = [(a.v_proj.weight[(h // (nq // nkv)) * hd:(h // (nq // nkv) + 1) * hd].float() * g,
-                              a.o_proj.weight[:, h * hd:(h + 1) * hd].float()) for h in range(nq)]
-                else:
-                    a = lay.linear_attn; hd = a.head_v_dim; o = 2 * a.key_dim
-                    heads = [(a.in_proj_qkv.weight[o + h * hd:o + (h + 1) * hd].float() * g,
-                              a.out_proj.weight[:, h * hd:(h + 1) * hd].float() * a.norm.weight.float())
-                             for h in range(a.num_v_heads)]
+                g = 1.0 + self.arch.pre_attn_norm(lay).weight.float()
+                heads = self.arch.head_io_weights(lay, g)
+                if heads is None:
+                    continue
                 for h, (WV, WO) in enumerate(heads):
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
+                    hd = WV.shape[0]
                     spans.append((l, h, at, at + hd)); at += hd
         self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans)
         return self._hb
@@ -441,20 +462,22 @@ class Runtime:
         side is z-scored over its heads; returns {layer: [z per head]}."""
         QV, QO, spans = self._head_bases()
         with self.lock, torch.inference_mode():
-            me = self.lm.layers[layer]
-            d = me.mlp.down_proj.weight[:, n].float()
-            w = 1.0 + me.post_attention_layernorm.weight.float()
-            gr, ur = me.mlp.gate_proj.weight[n].float() * w, me.mlp.up_proj.weight[n].float() * w
-            pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
-            pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
-        dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
+            d = self.arch.down_col(layer, n)
+            rows = self.arch.read_rows(layer, n)  # gate and up rows (SwiGLU), or the single MLP-in row
+            pr = (QV.T @ d.to(QV.dtype)).cpu()  # projections of the down column on every head's read basis
+            ps = [(QO.T @ r.to(QO.dtype)).cpu() for r in rows]
+        dn, hid = float(d.norm()), d.shape[0]
+        ns = [float(r.norm()) for r in rows]
         reads, writes = [], []
         for l, h, a, b in spans:
             base = ((b - a) / hid) ** 0.5  # a random direction's expected share of a (b - a)-dim space
             if l > layer:
                 reads.append((l, h, float(pr[a:b].norm()) / dn / base))
             else:
-                writes.append((l, h, float(pg[a:b].norm()) / gn * float(pu[a:b].norm()) / un / base ** 2))
+                share = 1.0
+                for p, nrm in zip(ps, ns):
+                    share *= float(p[a:b].norm()) / nrm / base
+                writes.append((l, h, share))
         out = {}
         for side in (reads, writes):
             if len(side) < 2:
@@ -478,24 +501,14 @@ class Runtime:
             for role in ("q", "k"):
                 cols, spans, at = [], [], 0
                 for l, lay in enumerate(self.lm.layers):
-                    g = 1.0 + lay.input_layernorm.weight.float()
-                    if hasattr(lay, "self_attn"):
-                        a = lay.self_attn; hd = a.head_dim
-                        nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
-                        if role == "q":
-                            Wq = a.q_proj.weight.view(nq, 2 * hd, -1)[:, :hd]
-                            units = [(Wq[h], [h]) for h in range(nq)]
-                        else:
-                            rep = nq // nkv
-                            units = [(a.k_proj.weight[kv * hd:(kv + 1) * hd], list(range(kv * rep, (kv + 1) * rep))) for kv in range(nkv)]
-                    else:
-                        a = lay.linear_attn; hd = a.head_k_dim; rep = a.num_v_heads // a.num_k_heads
-                        o = 0 if role == "q" else a.key_dim
-                        units = [(a.in_proj_qkv.weight[o + kh * hd:o + (kh + 1) * hd], list(range(kh * rep, (kh + 1) * rep)))
-                                 for kh in range(a.num_k_heads)]
+                    g = 1.0 + self.arch.pre_attn_norm(lay).weight.float()
+                    units, _ = self.arch.head_qk_units(lay, role, g)
                     for W, hs in units:
-                        cols.append(torch.linalg.qr((W.float() * g).T.cpu())[0].half())
+                        cols.append(torch.linalg.qr(W.T.cpu())[0].half())
                         spans.append((l, hs, at, at + W.shape[0])); at += W.shape[0]
+                if not cols:
+                    out[role] = (None, [])
+                    continue
                 out[role] = (torch.cat(cols, 1).to(self.dev), spans)
         self._qkb = out
         return out
@@ -509,11 +522,14 @@ class Runtime:
         qk = self._qk_bases()
         zs = self.neuron_heads(layer, n)
         with self.lock, torch.inference_mode():
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+            d = self.arch.down_col(layer, n)
             dn = float(d.norm())
-            proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items()}
+            proj = {r: (B.T @ d.half().to(B.device)).float().cpu() for r, (B, _) in qk.items() if B is not None}
         roles = {}
         for r, (_, spans) in qk.items():  # shares relative to a random direction's, as in neuron_heads
+            if not spans:
+                roles[r] = []
+                continue
             side = [(l, hs, float(proj[r][a:b].norm()) / dn / ((b - a) / d.shape[0]) ** 0.5) for l, hs, a, b in spans if l > layer]
             if len(side) < 2:
                 roles[r] = []
@@ -537,8 +553,7 @@ class Runtime:
         return roles
 
     def n_heads(self, layer):
-        L = self.lm.layers[layer]
-        return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
+        return self.arch.n_heads(layer)
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
@@ -550,7 +565,10 @@ class Runtime:
     def layer_resid_p50(self, layer):
         if layer in self.resid_p50:
             return self.resid_p50[layer]
-        path = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")
+        path = os.path.join(self.stats_dir, f"{self.model_slug}_L{layer}.npz")
+        legacy = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")  # stats files shipped with the repo
+        if not os.path.exists(path) and os.path.exists(legacy):
+            path = legacy
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
@@ -564,15 +582,14 @@ class Runtime:
         return v
 
     def down_col(self, layer, n):
-        return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+        return self.arch.down_col(layer, n)
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
         return self.messages_ids([{"role": "user", "content": prompt}])
 
     def messages_ids(self, messages):
-        enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
-        return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
+        return self.arch.messages_ids(messages)
 
     def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=200, cancel=None):
         """Greedy-decodes three conversations in one batch: row 0 pushed up, row 1 unsteered, row 2 pushed down.
@@ -600,12 +617,12 @@ class Runtime:
                 ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
-                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
+                eos = self.arch.eos_ids()
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
                 gens = [torch.Generator().manual_seed(int(seed)) for _ in range(3)]
                 seen = None
                 if repetition_penalty != 1.0:
-                    seen = torch.zeros(3, self.model.lm_head.out_features, dtype=torch.bool, device=self.dev)
+                    seen = torch.zeros(3, self.arch.lm_head.out_features, dtype=torch.bool, device=self.dev)
                     for r, q in enumerate(seqs):
                         seen[r, torch.tensor(q, device=self.dev)] = True
                 self._push = push
@@ -634,7 +651,7 @@ class Runtime:
                             if done[r]:
                                 continue
                             t = int(nxt[r])
-                            if t == eos:
+                            if t in eos:
                                 done[r] = True
                                 continue
                             out_ids[r].append(t)
@@ -744,7 +761,7 @@ class Runtime:
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
         if self._con_idx is None:
-            path = os.path.join(CACHE, "connections.npz")
+            path = self._cache("connections.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._con_idx = {key: z[key] for key in z.files}
@@ -756,7 +773,7 @@ class Runtime:
     # ---------- logit lens ----------
     def lens_index(self):
         if self._lens_idx is None:
-            path = os.path.join(CACHE, "lens_index.npz")
+            path = self._cache("lens_index.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._lens_idx = {"up": z["up"], "down": z["down"]}
@@ -764,7 +781,7 @@ class Runtime:
 
     def steer_index(self):
         if getattr(self, "_steer_idx", None) is None:
-            path = os.path.join(CACHE, "steer_index.npz")
+            path = self._cache("steer_index.npz")
             self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
         return self._steer_idx or None
 
@@ -786,7 +803,7 @@ class Runtime:
             d = self.down_col(layer, n).to(self.model.dtype)[None, None]
             out = {}
             for sign, name in ((1, "up"), (-1, "down")):
-                logits = self.model.lm_head(self.lm.norm(sign * d))[0, 0].float()
+                logits = self.arch.lm_head(self.arch.final_norm(sign * d))[0, 0].float()
                 top = logits.topk(k).indices.tolist()
                 out[name] = [self.tok.decode([t]) for t in top]
         self._lens_cache[(layer, n, k)] = out
@@ -833,23 +850,24 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
+            d = self.arch.mlp_down(self.lm.layers[layer]).weight[:, n]
             me = self.lm.layers[layer]
-            scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
-            r_g = me.mlp.gate_proj.weight[n] * scale_me
-            r_u = me.mlp.up_proj.weight[n] * scale_me
+            scale_me = (1.0 + self.arch.pre_mlp_norm(me).weight.float()).to(dt)
+            my_rows = [p.weight[n] * scale_me for p in self.arch.mlp_rows(me)]
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
-                    v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
-                    g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
+                    v = d * (1.0 + self.arch.pre_mlp_norm(Lyr).weight.float()).to(dt)
+                    acts = [(p.weight @ v).float() for p in self.arch.mlp_rows(Lyr)]
                     side = "down"
                 else:
-                    W = Lyr.mlp.down_proj.weight
-                    g, u = (r_g @ W).float(), (r_u @ W).float()
+                    W = self.arch.mlp_down(Lyr).weight
+                    acts = [(r @ W).float() for r in my_rows]
                     side = "up"
-                prod = g * u
+                prod = acts[0]
+                for x in acts[1:]:
+                    prod = prod * x
                 mag = prod.abs()
                 z = (mag - mag.mean()) / (mag.std() + 1e-8)
                 top = z.topk(min(k, z.numel()))
@@ -865,8 +883,8 @@ class Runtime:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
             elif every and lens_k:
-                D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
-                logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
+                D = torch.stack([self.arch.down_col(c["layer"], c["n"]).to(self.model.dtype) for c in every])
+                logits = self.arch.lm_head(self.arch.final_norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
                     c["lens"] = [self.tok.decode([t]) for t in row]
@@ -884,16 +902,16 @@ class Runtime:
         """Top-k tokens each neuron's down column pushes up and down, for every layer. Saved as int32 arrays
         up[L, N, k], down[L, N, k]."""
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        L, N = len(self.lm.layers), self.arch.n_neurons
         up = np.zeros((L, N, k), np.int32)
         down = np.zeros((L, N, k), np.int32)
         for li, layer in enumerate(self.lm.layers):
             self.status = f"indexing lens {li}/{L}"
             with self.lock, torch.inference_mode():
-                W = layer.mlp.down_proj.weight  # [hidden, inter]
+                W = self.arch.mlp_down(layer).weight  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
-                    logits = self.model.lm_head(self.lm.norm(D))[:, 0]
+                    logits = self.arch.lm_head(self.arch.final_norm(D))[:, 0]
                     up[li, s:s + chunk] = logits.topk(k).indices.cpu().numpy()
                     down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
         np.savez(path, up=up, down=down)
@@ -902,12 +920,12 @@ class Runtime:
 
     def vocab_strings(self):
         if getattr(self, "_vocab", None) is None:
-            path = os.path.join(CACHE, "vocab.json")
+            path = self._cache("vocab.json")
             if os.path.exists(path):
                 self._vocab = json.load(open(path))
             else:
                 if self.tok is None:
-                    self.tok = AutoTokenizer.from_pretrained(MODEL)
+                    self.tok = self.arch.tok
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
                 json.dump(self._vocab, open(path, "w"))
         return self._vocab
@@ -930,7 +948,7 @@ class Runtime:
         """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
         from datasets import load_dataset
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        L, N = len(self.lm.layers), self.arch.n_neurons
         pos, neg = np.zeros((L, N), np.float32), np.zeros((L, N), np.float32)
         buf, seen = [], 0
         for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):

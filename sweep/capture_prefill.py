@@ -14,7 +14,9 @@ import time
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "explorer"))
+from arch import Adapter
 
 
 class Stop(Exception):
@@ -32,8 +34,9 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    lm = model.model.language_model
+    ad = Adapter(a.model)
+    model = ad.load(device="cuda")
+    lm = ad.lm
     state = {"push_layer": None, "vec": None, "caps": {}, "last": None}
 
     def push_hook(i):
@@ -62,7 +65,7 @@ def main():
         if os.path.exists(out_path):
             print(f"{name}: exists, skipping", flush=True)
             continue
-        w_down = lm.layers[layer].mlp.down_proj.weight.detach().T.float().cpu().numpy()  # [N, hidden]
+        w_down = Adapter.mlp_down(lm.layers[layer]).weight.detach().T.float().cpu().numpy()  # [N, hidden]
         rows = [json.loads(l) for l in open(run)]
         n_ctrl = max([r["neuron"] for r in rows if r["kind"] == "random"], default=-1) + 1
         rng = np.random.default_rng(a.seed)

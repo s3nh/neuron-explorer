@@ -22,7 +22,11 @@ import time
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForImageTextToText, AutoTokenizer
+from transformers import AutoTokenizer
+
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "explorer"))
+from arch import Adapter
 
 
 def text_stream(tok, seed):
@@ -30,7 +34,7 @@ def text_stream(tok, seed):
     chat = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True).shuffle(seed=seed)
     for w, c in zip(web, chat):
         yield w["text"]
-        yield tok.apply_chat_template(c["messages"], tokenize=False, enable_thinking=False)
+        yield tok.apply_chat_template(c["messages"], tokenize=False)
 
 
 def windows(tok, seq_len, batch, seed):
@@ -81,8 +85,9 @@ def main():
     layers = [int(x) for x in a.layers.split(",")]
 
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForImageTextToText.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    lm = model.model.language_model
+    ad = Adapter(a.model)
+    model = ad.load(device="cuda")
+    lm = ad.lm
     lm.layers = lm.layers[: max(layers) + 1]  # nothing past the deepest target layer is needed
 
     stats = {}
@@ -107,7 +112,7 @@ def main():
     for l, s in stats.items():
         pp, nn, pn, np_ = (x.cpu().numpy() for x in (s.pp_max, s.nn_max, s.pn_min, s.np_min))
         abs_max = np.maximum.reduce([pp, nn, -pn, -np_])
-        w_down = lm.layers[l].mlp.down_proj.weight.detach().float().T.cpu().numpy().astype(np.float16)
+        w_down = Adapter.mlp_down(lm.layers[l]).weight.detach().float().T.cpu().numpy().astype(np.float16)
         resid_q = np.quantile(torch.cat(s.resid_norms).numpy(), [0.1, 0.5, 0.9])
         path = f"{a.out}_L{l}.npz"
         np.savez(path, pp_max=pp, nn_max=nn, pn_min=pn, np_min=np_, abs_max=abs_max, w_down=w_down,

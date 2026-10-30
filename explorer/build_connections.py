@@ -20,6 +20,10 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from arch import Adapter
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
 ap.add_argument("--k", type=int, default=24)
@@ -29,7 +33,8 @@ dev = "cuda" if torch.cuda.is_available() else "mps"
 
 root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
 index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
+_cfg = json.load(open(os.path.join(root, "config.json")))
+cfg = _cfg.get("text_config", _cfg)
 L, N, K = cfg["num_hidden_layers"], cfg["intermediate_size"], a.k
 
 
@@ -38,7 +43,7 @@ def tensor(name):
         return f.get_tensor(name).to(dev, torch.bfloat16)
 
 
-pre = "model.language_model.layers.{}."
+pre = Adapter.weight_prefixes(index) + "{}."
 down = [tensor(pre.format(l) + "mlp.down_proj.weight") for l in range(L)]
 gate = [tensor(pre.format(l) + "mlp.gate_proj.weight") for l in range(L)]
 up = [tensor(pre.format(l) + "mlp.up_proj.weight") for l in range(L)]
